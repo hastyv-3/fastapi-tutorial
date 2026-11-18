@@ -35,7 +35,7 @@ class User(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(100), nullable=False)
-    email = Column(String(100), nullable=False)
+    email = Column(String(100), unique=True, nullable=False)
     role = Column(String(100), nullable=False)
     hashed_pwd = Column(String(100), nullable=False)
     is_active = Column(Boolean, default=True)
@@ -136,7 +136,12 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     return user
     
 def get_current_active_user(current_user: User = Depends(get_current_user)):
-    pass
+    if not current_user["is_active"]:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Inactive User",
+        )
+    return current_user
 
 
 @app.get("/")
