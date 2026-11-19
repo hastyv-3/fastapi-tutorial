@@ -7,12 +7,12 @@
 from datetime import datetime, timedelta, timezone
 from fastapi import Depends, FastAPI, HTTPException, Path, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from passlib.context import CryptContext
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Boolean, Column, Integer, String
+from sqlalchemy import create_engine, Boolean, Integer, String
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.orm import Mapped, mapped_column, sessionmaker, Session
 from typing import List, Optional
+import bcrypt
 import jwt
 
 app = FastAPI(title="Integration with SQL")
@@ -21,7 +21,7 @@ SECRET_KEY = "asdf"
 ALGORITHM = "HS256"
 TOKEN_EXPIRES = 30
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 # Database Ssetup
@@ -33,12 +33,12 @@ Base = declarative_base()
 class User(Base):
     __tablename__="users"
 
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(100), nullable=False)
-    email = Column(String(100), unique=True, nullable=False)
-    role = Column(String(100), nullable=False)
-    hashed_pwd = Column(String(100), nullable=False)
-    is_active = Column(Boolean, default=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    email: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+    role: Mapped[str] = mapped_column(String(100), nullable=False)
+    hashed_pwd: Mapped[str] = mapped_column(String(100), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 Base.metadata.create_all(engine)
 
@@ -73,11 +73,11 @@ class TokenData(BaseModel):
 
 # Security functions
 def verify_pwd(plain_pwd: str, hashed_pwd: str) -> bool:
-    return pwd_context.verify(plain_pwd, hashed_pwd)
+    return bcrypt.checkpw(plain_pwd.encode("utf-8"), hashed_pwd.encode("utf-8"))
 
 
 def get_pwd_hash(password: str) -> str:
-    return pwd_context.hash(password)
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
@@ -136,7 +136,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     return user
     
 def get_current_active_user(current_user: User = Depends(get_current_user)):
-    if not current_user["is_active"]:
+    if not current_user.is_active:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Inactive User",
@@ -144,20 +144,74 @@ def get_current_active_user(current_user: User = Depends(get_current_user)):
     return current_user
 
 
+# Auth endpoints
+@app.post("/register", response_model=UserResponse)
+def register_user(user: UserCreate, db: Session = Depends(get_db)):
+    if db.query(User).filter(User.email == user.email).first():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="User already exists.")
+
+    hashed_password = get_pwd_hash(user.password)
+    db_user = User ( 
+        name = user.name,
+        email = user.email,
+        role = user.role,
+        hashed_pwd = hashed_password,
+
+    )
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
+
+@app.post("/token", response_model=Token)
+def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == form_data.username).first()
+
+    if not user or not verify_pwd(form_data.password, user.hashed_pwd):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid login")
+
+    if not user.is_active:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Inactive user")
+
+    access_token_expires = timedelta(minutes=TOKEN_EXPIRES)
+    access_token = create_access_token(data={"sub": user.email}, expires_delta=access_token_expires)
+    return {"access_token": access_token, "token_type": "bearer"}
+
 @app.get("/")
 def root() -> dict[str, str]:
     return {"message": "Hello, World"}
 
+@app.get("/profile", response_model=UserResponse)
+def get_profile(current_user: User = Depends(get_current_active_user)):
+    return current_user
 
+@app.get("/verify-token")
+def verify_token_endpoint(current_user: User = Depends(get_current_active_user)):
+    return {
+        "valid": True,
+        "user": {
+            "id": current_user.id,
+            "name": current_user.name,
+            "email":current_user.email,
+            "role": current_user.role
+        }
+
+    }
 # Create User
 @app.post("/users/", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-def create_user(user: UserCreate, db: Session = Depends(get_db)):
+def create_user(user: UserCreate, current_user: User = Depends(get_current_active_user), db: Session = Depends(get_db)):
     # Check if user exists
     if db.query(User).filter(User.email == user.email).first():
         raise HTTPException(status_code=409, detail="User already exists.")
 
     # Create new user
-    new_user = User(**user.model_dump())
+    hashed_password = get_pwd_hash(user.password)
+    new_user = User(
+            name = user.name,
+            email = user.email,
+            role = user.role,
+            hashed_pwd = hashed_password
+        )
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
@@ -165,7 +219,7 @@ def create_user(user: UserCreate, db: Session = Depends(get_db)):
 
 # Read User
 @app.get("/users/{user_id}", response_model=UserResponse)
-def get_user(user_id: int, db: Session = Depends(get_db)):
+def get_user(user_id: int, current_user: User = Depends(get_current_active_user), db: Session = Depends(get_db)):
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
@@ -173,13 +227,14 @@ def get_user(user_id: int, db: Session = Depends(get_db)):
 
 # Update User
 @app.put("/users/{user_id}", response_model=UserResponse)
-def update_user(user_id: int, user: UserCreate, db: Session = Depends(get_db)):
+def update_user(user_id: int, updated_user: UserCreate, current_user: User = Depends(get_current_active_user), db: Session = Depends(get_db)):
     db_user = db.query(User).filter(User.id == user_id).first()
     if not db_user:
         raise HTTPException(status_code=404, detail="User does not exist.")
 
-    for field, value in user.model_dump().items():
-        setattr(db_user, field, value)
+    db_user.name = updated_user.name 
+    db_user.email = updated_user.email
+    db_user.role = updated_user.role
 
     db.commit()
     db.refresh(db_user)
@@ -188,10 +243,13 @@ def update_user(user_id: int, user: UserCreate, db: Session = Depends(get_db)):
 
 # Delete User
 @app.delete("/users/{user_id}", response_model=UserResponse)
-def delete_user(user_id: int, db: Session= Depends(get_db)):
+def delete_user(user_id: int, current_user: User = Depends(get_current_active_user), db: Session= Depends(get_db)):
     db_user = db.query(User).filter(User.id == user_id).first()
     if not db_user:
         raise HTTPException(status_code=404, detail="User does not exist.")
+
+    if user_id == current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Can't delete own account")
 
     db.delete(db_user)
     db.commit()
@@ -199,12 +257,12 @@ def delete_user(user_id: int, db: Session= Depends(get_db)):
 
 # Get all Users
 @app.get("/users/", response_model=List[UserResponse])
-def get_all_users(db: Session = Depends(get_db)):
+def get_all_users(current_user: User = Depends(get_current_active_user), db: Session = Depends(get_db)):
     return db.query(User).all()
 
 # Search User
 @app.get("/users/search/", response_model=UserResponse)
-def search_user(email: Optional[str] = None, db: Session = Depends(get_db)):
+def search_user(email: Optional[str] = None, current_user: User = Depends(get_current_active_user), db: Session = Depends(get_db)):
     db_user = db.query(User).filter(User.email == email).first()
     if not db_user:
         raise HTTPException(status_code=404, detail="User not found.")
